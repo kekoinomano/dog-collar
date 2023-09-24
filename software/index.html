@@ -1,0 +1,246 @@
+<html>
+<head>
+    <title>PCM Player</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://unpkg.com/pcm-player"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@alexanderolsen/libsamplerate-js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+</head>
+<style type="text/css">
+    /* Estilo básico para los botones */
+    body{
+        background: black;
+    }
+    h3{
+        color: white;
+        position: absolute;
+        text-align: center;
+        top: 10px;
+    }
+    .container{
+        display: flex;
+        width: 100%;
+        height: 100%;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+    }
+    button {
+        width: fit-content;
+        margin: 20px;
+        color: white;
+        border: none;
+        background-color: transparent;
+        font-size: 24px; /* Tamaño inicial de los íconos */
+        cursor: pointer;
+        outline: none;
+    }
+
+    /* Animación de parpadeo */
+    @keyframes blink {
+        0% { opacity: 1; }
+        50% { opacity: 0.5; }
+        100% { opacity: 1; }
+    }
+
+    /* Estilo de botón cuando está pulsado */
+    button:active {
+        animation: blink 1s infinite;
+    }
+
+</style>
+<body>
+    <div class="container">
+        <h3 id="action-txt"></h3>
+        <button id="recordButton">
+            <i class="fas fa-microphone"></i>
+        </button>
+        <button id="listenBtn">
+            <i class="fa-solid fa-headphones"></i>
+        </button>
+    </div>
+
+
+<script>
+var isListening = false;
+let isRecording = false;
+const recordButton = document.getElementById('recordButton');
+const listenBtn = document.getElementById('listenBtn');
+const serverUrl = "wss://examiun.com:8888"; 
+const ws = new WebSocket(serverUrl);
+//Cosas de escuchar
+var player;
+//Cosas de enviar
+let sourceNode;
+let audioContext;
+let recorderNode;
+let stream;
+
+listenBtn.addEventListener('mousedown', startListening);
+listenBtn.addEventListener('mouseup', stopListening);
+listenBtn.addEventListener('touchstart', function(event) {
+    // Previniendo comportamientos predeterminados y eventos múltiples
+    event.preventDefault();
+    startListening();
+});
+listenBtn.addEventListener('touchend', function(event) {
+    // Previniendo comportamientos predeterminados y eventos múltiples
+    event.preventDefault();
+    stopListening();
+});
+recordButton.addEventListener('mousedown', startRecording);
+recordButton.addEventListener('mouseup', stopRecording);
+recordButton.addEventListener('touchstart', function(event) {
+    // Previniendo comportamientos predeterminados y eventos múltiples
+    event.preventDefault();
+    startRecording();
+});
+recordButton.addEventListener('touchend', function(event) {
+    // Previniendo comportamientos predeterminados y eventos múltiples
+    event.preventDefault();
+    stopRecording();
+});
+
+
+ws.onopen = function(event) {
+    console.log('WebSocket opened:', event);
+};
+
+ws.onerror = function(event) {
+    console.error('WebSocket Error:', event);
+};
+
+ws.onclose = function(event) {
+    if (event.wasClean) {
+        console.log(`Closed cleanly, code=${event.code}, reason=${event.reason}`);
+    } else {
+        console.error('Connection died');
+    }
+};
+
+//Cosas de escuchar audio
+function startListening() {
+    isListening = true;
+    player = new PCMPlayer({
+        inputCodec: 'Int16',
+        channels: 1,
+        sampleRate: 16000,
+    });
+    player.volume(1);
+    ws.send("START_LISTENING");
+    document.getElementById("action-txt").innerHTML = "Listening...";
+    console.log("START_LISTENING");
+    ws.binaryType = 'arraybuffer';
+    ws.removeEventListener('message', handleMessage);
+    ws.addEventListener('message', handleMessage);
+}
+
+function stopListening() {
+    isListening = false;
+    console.log("STOP_LISTENING");
+    ws.send("STOP_LISTENING");
+    player.pause();
+    document.getElementById("action-txt").innerHTML = "";
+}
+function handleMessage(event) {
+    if (isListening && event.data instanceof ArrayBuffer) {
+        player.feed(event.data);
+    }
+}
+
+//Cosas de enviar audio
+async function startRecording() {
+    if (!isRecording) {
+        // Inicia el audioContext aquí si no se ha iniciado antes
+        resumeAudioContextOnUserGesture();
+        if (!audioContext) {
+            audioContext = new AudioContext();
+            await audioContext.audioWorklet.addModule('js/audio-processor.js');
+        }
+        ws.send("START_RECORDING");
+        console.log("Empieza a grabar");
+        document.getElementById("action-txt").innerHTML = "Recording...";
+        isRecording = true;
+        //recordButton.textContent = "Stop Recording";
+        const constraints = {
+            audio: {
+                channelCount: 1,
+                volume: 1.0
+            }
+        };
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks.length > 0) {
+            const settings = audioTracks[0].getSettings();
+            console.log(`Sample Rate obtenido: ${settings.sampleRate}`);
+        }
+         // Inicializar el resampler
+        const converterType = LibSampleRate.ConverterType.SRC_SINC_FASTEST;
+        const nChannels = 1; // Mono
+        const inputSampleRate = 48000; // asumiendo que esta es la tasa original que obtenemos
+        const outputSampleRate = 16000;
+
+        src = await LibSampleRate.create(nChannels, inputSampleRate, outputSampleRate, {
+          converterType: converterType
+        });
+        sourceNode = audioContext.createMediaStreamSource(stream);
+
+      recorderNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+      sourceNode.connect(recorderNode).connect(audioContext.destination);
+
+      let accumulationBuffer = new Int16Array();  // Esto es un buffer vacío al principio
+
+        recorderNode.port.onmessage = async (event) => {
+            let dataToResample = new Float32Array(event.data);
+            let resampledData = src.simple(dataToResample);
+            console.log(`Resampled data length: ${resampledData.length}`);
+            let pcm16Bit = new Int16Array(resampledData.length);
+            for (let i = 0; i < resampledData.length; i++) {
+                pcm16Bit[i] = Math.round(resampledData[i] * 0x7FFF);
+            }
+
+            accumulationBuffer = concatTypedArrays(accumulationBuffer, pcm16Bit);
+
+            if (accumulationBuffer.length >= 1024) {
+                let chunkToSend = accumulationBuffer.subarray(0, 1024); // Extraemos exactamente 1024 samples
+                ws.send(chunkToSend.buffer);
+                accumulationBuffer = accumulationBuffer.subarray(1024); // Nos quedamos con el resto para el próximo envío
+            }
+        };
+    }
+}
+function resumeAudioContextOnUserGesture() {
+    if (audioContext && audioContext.state === 'suspended') {
+        audioContext.resume().then(() => {
+            console.log('AudioContext resumed successfully.');
+        });
+    }
+}
+// Función para concatenar dos TypedArrays
+function concatTypedArrays(a, b) {
+    const c = new a.constructor(a.length + b.length);
+    c.set(a, 0);
+    c.set(b, a.length);
+    return c;
+}
+
+function stopRecording() {
+    if (isRecording) {
+        stream.getTracks().forEach(track => track.stop());
+        recorderNode.disconnect();
+        recorderNode.port.close();
+        isRecording = false;
+        document.getElementById("action-txt").innerHTML = "";
+        //recordButton.textContent = "Start Recording";
+        setTimeout(()=> {
+            ws.send("STOP_RECORDING");
+        },1000);
+
+    }
+}
+
+
+
+    </script>
+</body>
+</html>
